@@ -18,7 +18,7 @@ use std::io::prelude::*;
 use std::sync::Arc;
 use std::thread;
 use pbr::MultiBar;
-use ocl::{Context, Queue, Device, Program, Buffer, MemFlags, Kernel, SpatialDims};
+use ocl::{Context, Queue, Device, Program, Buffer, MemFlags, Kernel, SpatialDims, Platform};
 
 pub struct Config {
     big_endian: bool,
@@ -227,89 +227,138 @@ fn cpu_search(config: &Arc<Config>, strings: &Arc<Vec<u32>>, pointers: &Arc<FnvH
     heap
 }
 
-fn opencl_search(config: &Arc<Config>, strings: &Vec<u32>, pointers: &Vec<u32>) -> BinaryHeap::<(usize, u32)> {
+fn opencl_search(
+    config: &Arc<Config>,
+    strings: &[u32],
+    pointers: &[u32],
+) -> Result<BinaryHeap<(usize, u32)>, Box<dyn Error>> {
+    const OPENCL_CHUNK_SIZE: usize = 0x100000;
     let compute_program = r#"
-        __kernel void find(__global read_only uint* strings, 
-        ulong str_count, 
-        __global read_only uint* pointers,
-        ulong ptr_count,
-        __global write_only uint* results) {
-            uint current_addr = get_global_id(0) * 0x1000;
+        __kernel void find(__global const uint* strings,
+        uint str_count, 
+        __global const uint* pointers,
+        uint ptr_count,
+        uint offset,
+        uint base_start,
+        uint candidate_count,
+        __global uint* results) {
+            uint gid = get_global_id(0);
+            if (gid >= candidate_count) {
+                return;
+            }
+            ulong current_addr = ((ulong)base_start) + (((ulong)gid) * ((ulong)offset));
+            if (current_addr > 0xffffffffUL) {
+                results[gid] = 0;
+                return;
+            }
             uint intersect_count = 0;
             for (uint i=0; i<str_count; i++) {
-                unsigned long translated_string = ((ulong)strings[i]) + ((ulong)current_addr);
-                if (translated_string > 0xffffffff) {
+                ulong translated_string = ((ulong)strings[i]) + current_addr;
+                if (translated_string > 0xffffffffUL) {
                         break;
                 }
                 for (uint j=0; j<ptr_count; j++) {
-                    if (pointers[j] == translated_string) {
+                    if (pointers[j] == (uint)translated_string) {
                         intersect_count += 1;
                     }
                 }
             }
-            results[get_global_id(0)] = intersect_count;
+            results[gid] = intersect_count;
         }
     "#;
-    if config.offset != 0x1000 {
-        panic!("in opencl mode we support only 0x1000 offset");
+    if strings.len() > u32::max_value() as usize || pointers.len() > u32::max_value() as usize {
+        return Err("OpenCL path does not support > u32::MAX strings/pointers".into());
     }
-    let context = Context::builder().devices(Device::specifier()
-        .type_flags(ocl::flags::DEVICE_TYPE_GPU).first()).build().unwrap();
+    let platform = Platform::default();
+    let device = match Device::list(platform, Some(ocl::flags::DEVICE_TYPE_GPU))? {
+        gpu_devices if !gpu_devices.is_empty() => gpu_devices[0],
+        _ => {
+            let all_devices = Device::list(platform, None)?;
+            if all_devices.is_empty() {
+                return Err("no OpenCL devices found".into());
+            }
+            all_devices[0]
+        }
+    };
 
-    let device = context.devices()[0];
-    let queue = Queue::new(&context, device, None).unwrap();
+    let context = Context::builder()
+        .platform(platform)
+        .devices(device)
+        .build()?;
+    let queue = Queue::new(&context, device, None)?;
     let program = Program::builder()
         .src(compute_program)
         .devices(device)
         .build(&context)
-        .unwrap();
+        ?;
 
     let string_buffer = Buffer::<u32>::builder()
         .queue(queue.clone())
         .flags(MemFlags::new().read_only())
         .len(strings.len())
-        .copy_host_slice(&strings)
-        .build().expect("cannot build the strings buffer");
+        .copy_host_slice(strings)
+        .build()?;
 
     let pointer_buffer = Buffer::<u32>::builder()
         .queue(queue.clone())
         .flags(MemFlags::new().read_only())
         .len(pointers.len())
-        .copy_host_slice(&pointers)
-        .build().expect("cannot build the pointers buffer");
+        .copy_host_slice(pointers)
+        .build()?;
 
     let result_buffer = Buffer::<u32>::builder()
         .queue(queue.clone())
         .flags(MemFlags::new().write_only())
-        .len(0x100000)
-        .build().expect("cannot build the results buffer");
+        .len(OPENCL_CHUNK_SIZE)
+        .build()?;
 
     let kernel = Kernel::builder()
         .program(&program)
         .name("find")
         .queue(queue.clone())
-        .global_work_size(SpatialDims::One(0x100000))
+        .global_work_size(SpatialDims::One(OPENCL_CHUNK_SIZE))
         .arg_named("strings", &string_buffer)
-        .arg_named("str_count", string_buffer.len())
+        .arg_named("str_count", string_buffer.len() as u32)
         .arg_named("pointers", &pointer_buffer)
-        .arg_named("ptr_count", pointer_buffer.len())
+        .arg_named("ptr_count", pointer_buffer.len() as u32)
+        .arg_named("offset", config.offset)
+        .arg_named("base_start", 0u32)
+        .arg_named("candidate_count", 0u32)
         .arg_named("results", &result_buffer)
-        .build().unwrap();
+        .build()?;
 
-    unsafe { kernel.enq().unwrap(); }
+    let mut vec_result = vec![0u32; OPENCL_CHUNK_SIZE];
 
-    let mut vec_result = vec![0u32; result_buffer.len()];
-    result_buffer.read(&mut vec_result).enq().unwrap();
-
-    queue.finish().unwrap();
+    queue.finish()?;
     let mut heap = BinaryHeap::<(usize, u32)>::new();
-    for page in 0..(0x100000) {
-        let count = vec_result[page];
-        if count > 0 {
-            heap.push((count as usize, (page*0x1000) as u32));
+    let total_candidates = (u64::from(u32::max_value()) / u64::from(config.offset)) + 1;
+    let mut processed_candidates: u64 = 0;
+    while processed_candidates < total_candidates {
+        let remaining = total_candidates - processed_candidates;
+        let this_chunk = std::cmp::min(OPENCL_CHUNK_SIZE as u64, remaining) as usize;
+        let base_start =
+            (processed_candidates * u64::from(config.offset)) as u32;
+
+        kernel.set_arg("base_start", base_start)?;
+        kernel.set_arg("candidate_count", this_chunk as u32)?;
+
+        unsafe { kernel.enq()?; }
+        result_buffer.read(&mut vec_result[..this_chunk]).enq()?;
+
+        for (idx, count) in vec_result.iter().enumerate() {
+            if idx >= this_chunk {
+                break;
+            }
+            if *count > 0 {
+                let addr = base_start.wrapping_add((idx as u32).wrapping_mul(config.offset));
+                heap.push((*count as usize, addr));
+            }
         }
+
+        processed_candidates += this_chunk as u64;
     }
-    heap
+    queue.finish()?;
+    Ok(heap)
 }
 
 pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
@@ -330,17 +379,20 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     eprintln!("Located {} pointers", pointers.len());
 
     let shared_config = Arc::new(config);
-
+    let shared_strings = Arc::new(strings);
+    let shared_pointers = Arc::new(pointers);
 
     let mut heap = if shared_config.opencl{
-        let mut pointers_vec = Vec::<u32>::new();
-        for p in pointers {
-            pointers_vec.push(p);
+        let pointers_vec: Vec<u32> = shared_pointers.iter().cloned().collect();
+        match opencl_search(&shared_config, &shared_strings, &pointers_vec) {
+            Ok(opencl_heap) => opencl_heap,
+            Err(err) => {
+                eprintln!("OpenCL search failed: {}", err);
+                eprintln!("Falling back to CPU search.");
+                cpu_search(&shared_config, &shared_strings, &shared_pointers)
+            }
         }
-        opencl_search(&shared_config, &strings, &pointers_vec)
     } else {
-        let shared_strings = Arc::new(strings);
-        let shared_pointers = Arc::new(pointers);
         cpu_search(&shared_config, &shared_strings, &shared_pointers)
     };
 
@@ -359,6 +411,47 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    fn heap_to_map(mut heap: BinaryHeap<(usize, u32)>) -> HashMap<u32, usize> {
+        let mut out = HashMap::new();
+        while let Some((count, addr)) = heap.pop() {
+            out.insert(addr, count);
+        }
+        out
+    }
+
+    fn cpu_reference_search(
+        config: &Config,
+        strings: &[u32],
+        pointers: &FnvHashSet<u32>,
+    ) -> BinaryHeap<(usize, u32)> {
+        let mut heap = BinaryHeap::<(usize, u32)>::new();
+        let mut current_addr: u32 = 0;
+        loop {
+            let mut count = 0usize;
+            for s in strings {
+                match s.checked_add(current_addr) {
+                    Some(add) => {
+                        if pointers.contains(&add) {
+                            count += 1;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            if count > 0 {
+                heap.push((count, current_addr));
+            }
+
+            match current_addr.checked_add(config.offset) {
+                Some(next) => current_addr = next,
+                None => break,
+            }
+        }
+        heap
+    }
 
     #[test]
     #[should_panic]
@@ -406,5 +499,91 @@ mod tests {
         let interval = Interval::get_range(2, 3, 0x1000).unwrap();
         assert_eq!(interval.start_addr, 0xAAAAA000);
         assert_eq!(interval.end_addr, u32::max_value());
+    }
+
+    #[test]
+    fn opencl_matches_cpu_results() {
+        let config = Arc::new(Config {
+            big_endian: false,
+            filename: String::new(),
+            min_str_len: 0,
+            max_matches: 10,
+            offset: 0x80000000,
+            threads: 2,
+            opencl: true,
+        });
+
+        let strings = Arc::new(vec![0x1000u32, 0x2000u32, 0x3000u32]);
+        let pointers_vec = vec![
+            0x00001000u32,
+            0x00002000u32,
+            0x80001000u32,
+            0x11111111u32,
+        ];
+        let mut pointers_set = FnvHashSet::default();
+        for p in &pointers_vec {
+            pointers_set.insert(*p);
+        }
+        let pointers_set = Arc::new(pointers_set);
+
+        let cpu = cpu_reference_search(&config, &strings, &pointers_set);
+        let opencl = match opencl_search(&config, &strings, &pointers_vec) {
+            Ok(heap) => heap,
+            Err(err) => {
+                // Keep CI portable when OpenCL runtime/device is unavailable.
+                eprintln!("Skipping OpenCL regression assertion: {}", err);
+                return;
+            }
+        };
+
+        assert_eq!(heap_to_map(cpu), heap_to_map(opencl));
+    }
+
+    #[test]
+    fn benchmark_opencl_vs_cpu_reference() {
+        let config = Arc::new(Config {
+            big_endian: false,
+            filename: String::new(),
+            min_str_len: 0,
+            max_matches: 10,
+            offset: 0x01000000,
+            threads: 4,
+            opencl: true,
+        });
+
+        let strings: Vec<u32> = (0..4000).map(|i| (i as u32) * 0x20).collect();
+        let mut pointers_seed: Vec<u32> = (0..80000)
+            .map(|i| ((i as u32).wrapping_mul(0x1f123bb5)).rotate_left(7))
+            .collect();
+        // Force some deterministic hits for candidate base 0.
+        for s in strings.iter().take(2000) {
+            pointers_seed.push(*s);
+        }
+
+        let mut pointers_set = FnvHashSet::default();
+        for p in &pointers_seed {
+            pointers_set.insert(*p);
+        }
+        let pointers_vec: Vec<u32> = pointers_set.iter().cloned().collect();
+
+        let cpu_start = Instant::now();
+        let cpu = cpu_reference_search(&config, &strings, &pointers_set);
+        let cpu_elapsed = cpu_start.elapsed();
+
+        let opencl_start = Instant::now();
+        let opencl = match opencl_search(&config, &strings, &pointers_vec) {
+            Ok(heap) => heap,
+            Err(err) => {
+                eprintln!("OpenCL benchmark skipped: {}", err);
+                return;
+            }
+        };
+        let opencl_elapsed = opencl_start.elapsed();
+
+        assert_eq!(heap_to_map(cpu), heap_to_map(opencl));
+        eprintln!(
+            "benchmark_opencl_vs_cpu_reference: cpu={:?}, opencl={:?}",
+            cpu_elapsed, opencl_elapsed
+        );
     }
 }
