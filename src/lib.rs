@@ -17,6 +17,7 @@ use std::io::Cursor;
 use std::io::prelude::*;
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 use pbr::MultiBar;
 use ocl::{Context, Queue, Device, Program, Buffer, MemFlags, Kernel, SpatialDims, Platform};
 
@@ -233,11 +234,66 @@ fn opencl_search(
     pointers: &[u32],
 ) -> Result<BinaryHeap<(usize, u32)>, Box<dyn Error>> {
     const OPENCL_CHUNK_SIZE: usize = 0x100000;
+    let profile_opencl = std::env::var("RBASEFIND_OPENCL_PROFILE").ok().as_deref() == Some("1");
+    let opencl_total_start = Instant::now();
+    let mut opencl_setup_time = Duration::new(0, 0);
+    let mut opencl_kernel_time = Duration::new(0, 0);
+    let mut opencl_read_time = Duration::new(0, 0);
+    let mut opencl_heap_time = Duration::new(0, 0);
+    let mut opencl_chunks = 0u64;
+    let strings_in_count = strings.len();
+    let pointers_in_count = pointers.len();
+    let setup_start = Instant::now();
+
+    let mut sorted_strings = strings.to_vec();
+    sorted_strings.sort_unstable();
+    sorted_strings.dedup();
+    if sorted_strings.is_empty() {
+        return Ok(BinaryHeap::<(usize, u32)>::new());
+    }
+
+    let mut filtered_pointers: Vec<u32> = if config.offset == 1 {
+        pointers.to_vec()
+    } else {
+        let mask = config.offset - 1;
+        let mut string_low_bits = FnvHashSet::default();
+        for s in &sorted_strings {
+            string_low_bits.insert(*s & mask);
+        }
+        pointers
+            .iter()
+            .cloned()
+            .filter(|p| string_low_bits.contains(&(p & mask)))
+            .collect()
+    };
+    filtered_pointers.sort_unstable();
+    filtered_pointers.dedup();
+    if filtered_pointers.is_empty() {
+        if profile_opencl {
+            eprintln!(
+                "OpenCL profile: total={:?}, setup={:?}, kernel={:?}, readback={:?}, heap={:?}, chunks=0, candidates=0, strings_in={}, strings_unique={}, pointers_in={}, pointers_filtered=0",
+                opencl_total_start.elapsed(),
+                setup_start.elapsed(),
+                Duration::new(0, 0),
+                Duration::new(0, 0),
+                Duration::new(0, 0),
+                strings_in_count,
+                sorted_strings.len(),
+                pointers_in_count
+            );
+        }
+        return Ok(BinaryHeap::<(usize, u32)>::new());
+    }
+
+    let ptr_min = *filtered_pointers.first().unwrap();
+    let ptr_max = *filtered_pointers.last().unwrap();
     let compute_program = r#"
         __kernel void find(__global const uint* strings,
         uint str_count, 
         __global const uint* pointers,
         uint ptr_count,
+        uint ptr_min,
+        uint ptr_max,
         uint offset,
         uint base_start,
         uint candidate_count,
@@ -255,18 +311,34 @@ fn opencl_search(
             for (uint i=0; i<str_count; i++) {
                 ulong translated_string = ((ulong)strings[i]) + current_addr;
                 if (translated_string > 0xffffffffUL) {
-                        break;
+                    break;
                 }
-                for (uint j=0; j<ptr_count; j++) {
-                    if (pointers[j] == (uint)translated_string) {
-                        intersect_count += 1;
+                if (translated_string < (ulong)ptr_min) {
+                    continue;
+                }
+                if (translated_string > (ulong)ptr_max) {
+                    break;
+                }
+                uint target = (uint)translated_string;
+                uint lo = 0;
+                uint hi = ptr_count;
+                while (lo < hi) {
+                    uint mid = lo + ((hi - lo) >> 1);
+                    uint mid_val = pointers[mid];
+                    if (mid_val < target) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
                     }
+                }
+                if (lo < ptr_count && pointers[lo] == target) {
+                    intersect_count += 1;
                 }
             }
             results[gid] = intersect_count;
         }
     "#;
-    if strings.len() > u32::max_value() as usize || pointers.len() > u32::max_value() as usize {
+    if sorted_strings.len() > u32::max_value() as usize || filtered_pointers.len() > u32::max_value() as usize {
         return Err("OpenCL path does not support > u32::MAX strings/pointers".into());
     }
     let platform = Platform::default();
@@ -295,16 +367,17 @@ fn opencl_search(
     let string_buffer = Buffer::<u32>::builder()
         .queue(queue.clone())
         .flags(MemFlags::new().read_only())
-        .len(strings.len())
-        .copy_host_slice(strings)
+        .len(sorted_strings.len())
+        .copy_host_slice(&sorted_strings)
         .build()?;
 
     let pointer_buffer = Buffer::<u32>::builder()
         .queue(queue.clone())
         .flags(MemFlags::new().read_only())
-        .len(pointers.len())
-        .copy_host_slice(pointers)
+        .len(filtered_pointers.len())
+        .copy_host_slice(&filtered_pointers)
         .build()?;
+    opencl_setup_time += setup_start.elapsed();
 
     let result_buffer = Buffer::<u32>::builder()
         .queue(queue.clone())
@@ -321,6 +394,8 @@ fn opencl_search(
         .arg_named("str_count", string_buffer.len() as u32)
         .arg_named("pointers", &pointer_buffer)
         .arg_named("ptr_count", pointer_buffer.len() as u32)
+        .arg_named("ptr_min", ptr_min)
+        .arg_named("ptr_max", ptr_max)
         .arg_named("offset", config.offset)
         .arg_named("base_start", 0u32)
         .arg_named("candidate_count", 0u32)
@@ -334,6 +409,7 @@ fn opencl_search(
     let total_candidates = (u64::from(u32::max_value()) / u64::from(config.offset)) + 1;
     let mut processed_candidates: u64 = 0;
     while processed_candidates < total_candidates {
+        opencl_chunks += 1;
         let remaining = total_candidates - processed_candidates;
         let this_chunk = std::cmp::min(OPENCL_CHUNK_SIZE as u64, remaining) as usize;
         let base_start =
@@ -341,23 +417,52 @@ fn opencl_search(
 
         kernel.set_arg("base_start", base_start)?;
         kernel.set_arg("candidate_count", this_chunk as u32)?;
+        if profile_opencl {
+            let kernel_start = Instant::now();
+            unsafe { kernel.enq()?; }
+            queue.finish()?;
+            opencl_kernel_time += kernel_start.elapsed();
 
-        unsafe { kernel.enq()?; }
-        result_buffer.read(&mut vec_result[..this_chunk]).enq()?;
+            let read_start = Instant::now();
+            result_buffer.read(&mut vec_result[..this_chunk]).enq()?;
+            queue.finish()?;
+            opencl_read_time += read_start.elapsed();
+        } else {
+            unsafe { kernel.enq()?; }
+            result_buffer.read(&mut vec_result[..this_chunk]).enq()?;
+        }
 
-        for (idx, count) in vec_result.iter().enumerate() {
-            if idx >= this_chunk {
-                break;
-            }
+        let heap_start = Instant::now();
+        for (idx, count) in vec_result[..this_chunk].iter().enumerate() {
             if *count > 0 {
                 let addr = base_start.wrapping_add((idx as u32).wrapping_mul(config.offset));
                 heap.push((*count as usize, addr));
             }
         }
+        if profile_opencl {
+            opencl_heap_time += heap_start.elapsed();
+        }
 
         processed_candidates += this_chunk as u64;
     }
     queue.finish()?;
+    if profile_opencl {
+        let opencl_total_time = opencl_total_start.elapsed();
+        eprintln!(
+            "OpenCL profile: total={:?}, setup={:?}, kernel={:?}, readback={:?}, heap={:?}, chunks={}, candidates={}, strings_in={}, strings_unique={}, pointers_in={}, pointers_filtered={}",
+            opencl_total_time,
+            opencl_setup_time,
+            opencl_kernel_time,
+            opencl_read_time,
+            opencl_heap_time,
+            opencl_chunks,
+            total_candidates,
+            strings_in_count,
+            sorted_strings.len(),
+            pointers_in_count,
+            filtered_pointers.len()
+        );
+    }
     Ok(heap)
 }
 
@@ -546,13 +651,13 @@ mod tests {
             filename: String::new(),
             min_str_len: 0,
             max_matches: 10,
-            offset: 0x01000000,
+            offset: 0x00020000,
             threads: 4,
             opencl: true,
         });
 
         let strings: Vec<u32> = (0..4000).map(|i| (i as u32) * 0x20).collect();
-        let mut pointers_seed: Vec<u32> = (0..80000)
+        let mut pointers_seed: Vec<u32> = (0..400000)
             .map(|i| ((i as u32).wrapping_mul(0x1f123bb5)).rotate_left(7))
             .collect();
         // Force some deterministic hits for candidate base 0.
