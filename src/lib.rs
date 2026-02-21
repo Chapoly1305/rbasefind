@@ -234,6 +234,7 @@ fn opencl_search(
     pointers: &[u32],
 ) -> Result<BinaryHeap<(usize, u32)>, Box<dyn Error>> {
     const OPENCL_CHUNK_SIZE: usize = 0x100000;
+    const OPENCL_FAST_PAGE_COUNT: usize = 0x100000;
     let profile_opencl = std::env::var("RBASEFIND_OPENCL_PROFILE").ok().as_deref() == Some("1");
     let opencl_total_start = Instant::now();
     let mut opencl_setup_time = Duration::new(0, 0);
@@ -285,59 +286,6 @@ fn opencl_search(
         return Ok(BinaryHeap::<(usize, u32)>::new());
     }
 
-    let ptr_min = *filtered_pointers.first().unwrap();
-    let ptr_max = *filtered_pointers.last().unwrap();
-    let compute_program = r#"
-        __kernel void find(__global const uint* strings,
-        uint str_count, 
-        __global const uint* pointers,
-        uint ptr_count,
-        uint ptr_min,
-        uint ptr_max,
-        uint offset,
-        uint base_start,
-        uint candidate_count,
-        __global uint* results) {
-            uint gid = get_global_id(0);
-            if (gid >= candidate_count) {
-                return;
-            }
-            ulong current_addr = ((ulong)base_start) + (((ulong)gid) * ((ulong)offset));
-            if (current_addr > 0xffffffffUL) {
-                results[gid] = 0;
-                return;
-            }
-            uint intersect_count = 0;
-            for (uint i=0; i<str_count; i++) {
-                ulong translated_string = ((ulong)strings[i]) + current_addr;
-                if (translated_string > 0xffffffffUL) {
-                    break;
-                }
-                if (translated_string < (ulong)ptr_min) {
-                    continue;
-                }
-                if (translated_string > (ulong)ptr_max) {
-                    break;
-                }
-                uint target = (uint)translated_string;
-                uint lo = 0;
-                uint hi = ptr_count;
-                while (lo < hi) {
-                    uint mid = lo + ((hi - lo) >> 1);
-                    uint mid_val = pointers[mid];
-                    if (mid_val < target) {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                if (lo < ptr_count && pointers[lo] == target) {
-                    intersect_count += 1;
-                }
-            }
-            results[gid] = intersect_count;
-        }
-    "#;
     if sorted_strings.len() > u32::max_value() as usize || filtered_pointers.len() > u32::max_value() as usize {
         return Err("OpenCL path does not support > u32::MAX strings/pointers".into());
     }
@@ -358,65 +306,77 @@ fn opencl_search(
         .devices(device)
         .build()?;
     let queue = Queue::new(&context, device, None)?;
-    let program = Program::builder()
-        .src(compute_program)
-        .devices(device)
-        .build(&context)
-        ?;
-
-    let string_buffer = Buffer::<u32>::builder()
-        .queue(queue.clone())
-        .flags(MemFlags::new().read_only())
-        .len(sorted_strings.len())
-        .copy_host_slice(&sorted_strings)
-        .build()?;
-
-    let pointer_buffer = Buffer::<u32>::builder()
-        .queue(queue.clone())
-        .flags(MemFlags::new().read_only())
-        .len(filtered_pointers.len())
-        .copy_host_slice(&filtered_pointers)
-        .build()?;
-    opencl_setup_time += setup_start.elapsed();
-
-    let result_buffer = Buffer::<u32>::builder()
-        .queue(queue.clone())
-        .flags(MemFlags::new().write_only())
-        .len(OPENCL_CHUNK_SIZE)
-        .build()?;
-
-    let kernel = Kernel::builder()
-        .program(&program)
-        .name("find")
-        .queue(queue.clone())
-        .global_work_size(SpatialDims::One(OPENCL_CHUNK_SIZE))
-        .arg_named("strings", &string_buffer)
-        .arg_named("str_count", string_buffer.len() as u32)
-        .arg_named("pointers", &pointer_buffer)
-        .arg_named("ptr_count", pointer_buffer.len() as u32)
-        .arg_named("ptr_min", ptr_min)
-        .arg_named("ptr_max", ptr_max)
-        .arg_named("offset", config.offset)
-        .arg_named("base_start", 0u32)
-        .arg_named("candidate_count", 0u32)
-        .arg_named("results", &result_buffer)
-        .build()?;
-
-    let mut vec_result = vec![0u32; OPENCL_CHUNK_SIZE];
-
-    queue.finish()?;
     let mut heap = BinaryHeap::<(usize, u32)>::new();
-    let total_candidates = (u64::from(u32::max_value()) / u64::from(config.offset)) + 1;
-    let mut processed_candidates: u64 = 0;
-    while processed_candidates < total_candidates {
-        opencl_chunks += 1;
-        let remaining = total_candidates - processed_candidates;
-        let this_chunk = std::cmp::min(OPENCL_CHUNK_SIZE as u64, remaining) as usize;
-        let base_start =
-            (processed_candidates * u64::from(config.offset)) as u32;
+    let total_candidates: u64;
+    if config.offset == 0x1000 {
+        let local_work_size = 256usize;
+        let global_work_size = ((filtered_pointers.len() + local_work_size - 1) / local_work_size) * local_work_size;
+        let compute_program = r#"
+            #define PAGE_MASK 0xFFFu
+            #define PAGE_SHIFT 12u
 
-        kernel.set_arg("base_start", base_start)?;
-        kernel.set_arg("candidate_count", this_chunk as u32)?;
+            __kernel void find(__global const uint* strings,
+            uint str_count,
+            __global const uint* pointers,
+            uint ptr_count,
+            __global uint* results) {
+                const uint gid = get_global_id(0);
+                if (gid >= ptr_count) {
+                    return;
+                }
+
+                const uint pointer = pointers[gid];
+                for (uint i = 0; i < str_count; i++) {
+                    const uint s = strings[i];
+                    if (pointer >= s) {
+                        const uint candidate_base = pointer - s;
+                        if ((candidate_base & PAGE_MASK) == 0u) {
+                            atomic_inc((volatile __global uint*) &results[candidate_base >> PAGE_SHIFT]);
+                        }
+                    }
+                }
+            }
+        "#;
+        let program = Program::builder()
+            .src(compute_program)
+            .devices(device)
+            .build(&context)?;
+        let string_buffer = Buffer::<u32>::builder()
+            .queue(queue.clone())
+            .flags(MemFlags::new().read_only())
+            .len(sorted_strings.len())
+            .copy_host_slice(&sorted_strings)
+            .build()?;
+        let pointer_buffer = Buffer::<u32>::builder()
+            .queue(queue.clone())
+            .flags(MemFlags::new().read_only())
+            .len(filtered_pointers.len())
+            .copy_host_slice(&filtered_pointers)
+            .build()?;
+        let result_init = vec![0u32; OPENCL_FAST_PAGE_COUNT];
+        let result_buffer = Buffer::<u32>::builder()
+            .queue(queue.clone())
+            .flags(MemFlags::new().read_write())
+            .len(OPENCL_FAST_PAGE_COUNT)
+            .copy_host_slice(&result_init)
+            .build()?;
+        let kernel = Kernel::builder()
+            .program(&program)
+            .name("find")
+            .queue(queue.clone())
+            .global_work_size(SpatialDims::One(global_work_size))
+            .local_work_size(SpatialDims::One(local_work_size))
+            .arg_named("strings", &string_buffer)
+            .arg_named("str_count", string_buffer.len() as u32)
+            .arg_named("pointers", &pointer_buffer)
+            .arg_named("ptr_count", pointer_buffer.len() as u32)
+            .arg_named("results", &result_buffer)
+            .build()?;
+        opencl_setup_time += setup_start.elapsed();
+
+        let mut vec_result = vec![0u32; OPENCL_FAST_PAGE_COUNT];
+        total_candidates = filtered_pointers.len() as u64;
+        opencl_chunks = 1;
         if profile_opencl {
             let kernel_start = Instant::now();
             unsafe { kernel.enq()?; }
@@ -424,26 +384,156 @@ fn opencl_search(
             opencl_kernel_time += kernel_start.elapsed();
 
             let read_start = Instant::now();
-            result_buffer.read(&mut vec_result[..this_chunk]).enq()?;
+            result_buffer.read(&mut vec_result).enq()?;
             queue.finish()?;
             opencl_read_time += read_start.elapsed();
         } else {
             unsafe { kernel.enq()?; }
-            result_buffer.read(&mut vec_result[..this_chunk]).enq()?;
+            result_buffer.read(&mut vec_result).enq()?;
+            queue.finish()?;
         }
 
         let heap_start = Instant::now();
-        for (idx, count) in vec_result[..this_chunk].iter().enumerate() {
+        for (page, count) in vec_result.iter().enumerate() {
             if *count > 0 {
-                let addr = base_start.wrapping_add((idx as u32).wrapping_mul(config.offset));
-                heap.push((*count as usize, addr));
+                heap.push((*count as usize, (page as u32) << 12));
             }
         }
         if profile_opencl {
             opencl_heap_time += heap_start.elapsed();
         }
+    } else {
+        let ptr_min = *filtered_pointers.first().unwrap();
+        let ptr_max = *filtered_pointers.last().unwrap();
+        let compute_program = r#"
+            __kernel void find(__global const uint* strings,
+            uint str_count,
+            __global const uint* pointers,
+            uint ptr_count,
+            uint ptr_min,
+            uint ptr_max,
+            uint offset,
+            uint base_start,
+            uint candidate_count,
+            __global uint* results) {
+                uint gid = get_global_id(0);
+                if (gid >= candidate_count) {
+                    return;
+                }
+                ulong current_addr = ((ulong)base_start) + (((ulong)gid) * ((ulong)offset));
+                if (current_addr > 0xffffffffUL) {
+                    results[gid] = 0;
+                    return;
+                }
+                uint intersect_count = 0;
+                for (uint i = 0; i < str_count; i++) {
+                    ulong translated_string = ((ulong)strings[i]) + current_addr;
+                    if (translated_string > 0xffffffffUL) {
+                        break;
+                    }
+                    if (translated_string < (ulong)ptr_min) {
+                        continue;
+                    }
+                    if (translated_string > (ulong)ptr_max) {
+                        break;
+                    }
+                    uint target = (uint)translated_string;
+                    uint lo = 0;
+                    uint hi = ptr_count;
+                    while (lo < hi) {
+                        uint mid = lo + ((hi - lo) >> 1);
+                        uint mid_val = pointers[mid];
+                        if (mid_val < target) {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    if (lo < ptr_count && pointers[lo] == target) {
+                        intersect_count += 1;
+                    }
+                }
+                results[gid] = intersect_count;
+            }
+        "#;
+        let program = Program::builder()
+            .src(compute_program)
+            .devices(device)
+            .build(&context)?;
+        let string_buffer = Buffer::<u32>::builder()
+            .queue(queue.clone())
+            .flags(MemFlags::new().read_only())
+            .len(sorted_strings.len())
+            .copy_host_slice(&sorted_strings)
+            .build()?;
+        let pointer_buffer = Buffer::<u32>::builder()
+            .queue(queue.clone())
+            .flags(MemFlags::new().read_only())
+            .len(filtered_pointers.len())
+            .copy_host_slice(&filtered_pointers)
+            .build()?;
+        let result_buffer = Buffer::<u32>::builder()
+            .queue(queue.clone())
+            .flags(MemFlags::new().write_only())
+            .len(OPENCL_CHUNK_SIZE)
+            .build()?;
+        let kernel = Kernel::builder()
+            .program(&program)
+            .name("find")
+            .queue(queue.clone())
+            .global_work_size(SpatialDims::One(OPENCL_CHUNK_SIZE))
+            .arg_named("strings", &string_buffer)
+            .arg_named("str_count", string_buffer.len() as u32)
+            .arg_named("pointers", &pointer_buffer)
+            .arg_named("ptr_count", pointer_buffer.len() as u32)
+            .arg_named("ptr_min", ptr_min)
+            .arg_named("ptr_max", ptr_max)
+            .arg_named("offset", config.offset)
+            .arg_named("base_start", 0u32)
+            .arg_named("candidate_count", 0u32)
+            .arg_named("results", &result_buffer)
+            .build()?;
+        opencl_setup_time += setup_start.elapsed();
 
-        processed_candidates += this_chunk as u64;
+        let mut vec_result = vec![0u32; OPENCL_CHUNK_SIZE];
+        total_candidates = (u64::from(u32::max_value()) / u64::from(config.offset)) + 1;
+        let mut processed_candidates: u64 = 0;
+        while processed_candidates < total_candidates {
+            opencl_chunks += 1;
+            let remaining = total_candidates - processed_candidates;
+            let this_chunk = std::cmp::min(OPENCL_CHUNK_SIZE as u64, remaining) as usize;
+            let base_start = (processed_candidates * u64::from(config.offset)) as u32;
+
+            kernel.set_arg("base_start", base_start)?;
+            kernel.set_arg("candidate_count", this_chunk as u32)?;
+            if profile_opencl {
+                let kernel_start = Instant::now();
+                unsafe { kernel.enq()?; }
+                queue.finish()?;
+                opencl_kernel_time += kernel_start.elapsed();
+
+                let read_start = Instant::now();
+                result_buffer.read(&mut vec_result[..this_chunk]).enq()?;
+                queue.finish()?;
+                opencl_read_time += read_start.elapsed();
+            } else {
+                unsafe { kernel.enq()?; }
+                result_buffer.read(&mut vec_result[..this_chunk]).enq()?;
+            }
+
+            let heap_start = Instant::now();
+            for (idx, count) in vec_result[..this_chunk].iter().enumerate() {
+                if *count > 0 {
+                    let addr = base_start.wrapping_add((idx as u32).wrapping_mul(config.offset));
+                    heap.push((*count as usize, addr));
+                }
+            }
+            if profile_opencl {
+                opencl_heap_time += heap_start.elapsed();
+            }
+
+            processed_candidates += this_chunk as u64;
+        }
     }
     queue.finish()?;
     if profile_opencl {
