@@ -75,6 +75,20 @@ user	0m0.751s
 sys	0m0.012s
 ```
 
+## Important: Interpreting Results
+
+`rbasefind` assumes a flat binary where file offset `0` maps to runtime base. If you scan a containerized input (for example ELF or OTA packages), the reported address may be shifted by header/payload offset.
+
+- Runtime base formula: `runtime_base = reported_base + executable_payload_offset`
+- ELF example: if first `PT_LOAD` has `Offset = 0x1000`, add `0x1000` to the reported base.
+- Best practice: extract the executable payload (`PT_LOAD` / OTA payload) and scan that blob directly.
+
+For Cortex-M targets, validate the final base before using it in IDA:
+
+- Vector table at mapped base should look sane.
+- Initial SP should point into SRAM and be aligned.
+- Reset vector should point into code and have Thumb bit set.
+
 ## GPU Acceleration
 
 With the `-c` flag you can run the search with OpenCL on the GPU for (sometimes) faster performances, for example:
