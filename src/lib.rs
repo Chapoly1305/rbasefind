@@ -228,6 +228,93 @@ fn cpu_search(config: &Arc<Config>, strings: &Arc<Vec<u32>>, pointers: &Arc<FnvH
     heap
 }
 
+fn cpu_search_fast(config: &Arc<Config>, strings: &[u32], pointers: &[u32]) -> BinaryHeap::<(usize, u32)> {
+    const BUCKET_COUNT: usize = 0x1000;
+    const PAGE_COUNT: usize = 0x100000;
+    const PAGE_SHIFT: u32 = 12;
+
+    if pointers.is_empty() || strings.is_empty() {
+        return BinaryHeap::<(usize, u32)>::new();
+    }
+
+    let mut bucket_counts = vec![0usize; BUCKET_COUNT];
+    for s in strings {
+        bucket_counts[(s & 0xFFF) as usize] += 1;
+    }
+
+    let mut bucket_offsets = vec![0usize; BUCKET_COUNT];
+    let mut running = 0usize;
+    for i in 0..BUCKET_COUNT {
+        bucket_offsets[i] = running;
+        running += bucket_counts[i];
+    }
+
+    let mut next_positions = bucket_offsets.clone();
+    let mut bucketed_strings = vec![0u32; strings.len()];
+    for s in strings {
+        let bucket = (s & 0xFFF) as usize;
+        let pos = next_positions[bucket];
+        bucketed_strings[pos] = *s;
+        next_positions[bucket] += 1;
+    }
+
+    let thread_count = config.threads.max(1);
+    eprintln!("Scanning with {} threads...", thread_count);
+
+    let pointers_arc = Arc::new(pointers.to_vec());
+    let strings_arc = Arc::new(bucketed_strings);
+    let offsets_arc = Arc::new(bucket_offsets);
+    let counts_arc = Arc::new(bucket_counts);
+
+    let chunk_size = (pointers_arc.len() + thread_count - 1) / thread_count;
+    let mut children = vec![];
+    for i in 0..thread_count {
+        let start = i * chunk_size;
+        if start >= pointers_arc.len() {
+            break;
+        }
+        let end = std::cmp::min(start + chunk_size, pointers_arc.len());
+        let local_pointers = Arc::clone(&pointers_arc);
+        let local_strings = Arc::clone(&strings_arc);
+        let local_offsets = Arc::clone(&offsets_arc);
+        let local_counts = Arc::clone(&counts_arc);
+        children.push(thread::spawn(move || {
+            let mut local_hist = vec![0u32; PAGE_COUNT];
+            for idx in start..end {
+                let pointer = local_pointers[idx];
+                let bucket = (pointer & 0xFFF) as usize;
+                let base = local_offsets[bucket];
+                let count = local_counts[bucket];
+                for s in &local_strings[base..(base + count)] {
+                    if pointer >= *s {
+                        let page = ((pointer - *s) >> PAGE_SHIFT) as usize;
+                        local_hist[page] += 1;
+                    }
+                }
+            }
+            local_hist
+        }));
+    }
+
+    let mut histogram = vec![0u32; PAGE_COUNT];
+    for child in children {
+        let local_hist = child.join().unwrap();
+        for i in 0..PAGE_COUNT {
+            histogram[i] += local_hist[i];
+        }
+    }
+
+    let mut heap = BinaryHeap::<(usize, u32)>::new();
+    for page in 0..PAGE_COUNT {
+        let count = histogram[page];
+        if count > 0 {
+            heap.push((count as usize, (page as u32) << PAGE_SHIFT));
+        }
+    }
+
+    heap
+}
+
 fn opencl_search(
     config: &Arc<Config>,
     strings: &[u32],
@@ -306,17 +393,40 @@ fn opencl_search(
         .devices(device)
         .build()?;
     let queue = Queue::new(&context, device, None)?;
+
     let mut heap = BinaryHeap::<(usize, u32)>::new();
     let total_candidates: u64;
     if config.offset == 0x1000 {
+        const BUCKET_COUNT: usize = 0x1000;
         let local_work_size = 256usize;
         let global_work_size = ((filtered_pointers.len() + local_work_size - 1) / local_work_size) * local_work_size;
+
+        let mut bucket_counts = vec![0u32; BUCKET_COUNT];
+        for s in &sorted_strings {
+            bucket_counts[(s & 0xFFF) as usize] += 1;
+        }
+        let mut bucket_offsets = vec![0u32; BUCKET_COUNT];
+        let mut running_offset = 0u32;
+        for i in 0..BUCKET_COUNT {
+            bucket_offsets[i] = running_offset;
+            running_offset += bucket_counts[i];
+        }
+        let mut next_positions = bucket_offsets.clone();
+        let mut bucketed_strings = vec![0u32; sorted_strings.len()];
+        for s in &sorted_strings {
+            let bucket = (s & 0xFFF) as usize;
+            let pos = next_positions[bucket] as usize;
+            bucketed_strings[pos] = *s;
+            next_positions[bucket] += 1;
+        }
+
         let compute_program = r#"
             #define PAGE_MASK 0xFFFu
             #define PAGE_SHIFT 12u
 
-            __kernel void find(__global const uint* strings,
-            uint str_count,
+            __kernel void find(__global const uint* bucket_strings,
+            __global const uint* bucket_offsets,
+            __global const uint* bucket_counts,
             __global const uint* pointers,
             uint ptr_count,
             __global uint* results) {
@@ -326,13 +436,14 @@ fn opencl_search(
                 }
 
                 const uint pointer = pointers[gid];
-                for (uint i = 0; i < str_count; i++) {
-                    const uint s = strings[i];
+                const uint bucket = pointer & PAGE_MASK;
+                const uint start = bucket_offsets[bucket];
+                const uint count = bucket_counts[bucket];
+                for (uint i = 0; i < count; i++) {
+                    const uint s = bucket_strings[start + i];
                     if (pointer >= s) {
                         const uint candidate_base = pointer - s;
-                        if ((candidate_base & PAGE_MASK) == 0u) {
-                            atomic_inc((volatile __global uint*) &results[candidate_base >> PAGE_SHIFT]);
-                        }
+                        atomic_inc((volatile __global uint*) &results[candidate_base >> PAGE_SHIFT]);
                     }
                 }
             }
@@ -341,11 +452,23 @@ fn opencl_search(
             .src(compute_program)
             .devices(device)
             .build(&context)?;
-        let string_buffer = Buffer::<u32>::builder()
+        let bucket_string_buffer = Buffer::<u32>::builder()
             .queue(queue.clone())
             .flags(MemFlags::new().read_only())
-            .len(sorted_strings.len())
-            .copy_host_slice(&sorted_strings)
+            .len(bucketed_strings.len())
+            .copy_host_slice(&bucketed_strings)
+            .build()?;
+        let bucket_offset_buffer = Buffer::<u32>::builder()
+            .queue(queue.clone())
+            .flags(MemFlags::new().read_only())
+            .len(bucket_offsets.len())
+            .copy_host_slice(&bucket_offsets)
+            .build()?;
+        let bucket_count_buffer = Buffer::<u32>::builder()
+            .queue(queue.clone())
+            .flags(MemFlags::new().read_only())
+            .len(bucket_counts.len())
+            .copy_host_slice(&bucket_counts)
             .build()?;
         let pointer_buffer = Buffer::<u32>::builder()
             .queue(queue.clone())
@@ -366,8 +489,9 @@ fn opencl_search(
             .queue(queue.clone())
             .global_work_size(SpatialDims::One(global_work_size))
             .local_work_size(SpatialDims::One(local_work_size))
-            .arg_named("strings", &string_buffer)
-            .arg_named("str_count", string_buffer.len() as u32)
+            .arg_named("bucket_strings", &bucket_string_buffer)
+            .arg_named("bucket_offsets", &bucket_offset_buffer)
+            .arg_named("bucket_counts", &bucket_count_buffer)
             .arg_named("pointers", &pointer_buffer)
             .arg_named("ptr_count", pointer_buffer.len() as u32)
             .arg_named("results", &result_buffer)
@@ -555,7 +679,6 @@ fn opencl_search(
     }
     Ok(heap)
 }
-
 pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // Read in the input file. We jam it all into memory for now.
     let mut f = File::open(&config.filename)?;
@@ -576,17 +699,23 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let shared_config = Arc::new(config);
     let shared_strings = Arc::new(strings);
     let shared_pointers = Arc::new(pointers);
+    let pointers_vec: Vec<u32> = shared_pointers.iter().cloned().collect();
 
-    let mut heap = if shared_config.opencl{
-        let pointers_vec: Vec<u32> = shared_pointers.iter().cloned().collect();
+    let mut heap = if shared_config.opencl {
         match opencl_search(&shared_config, &shared_strings, &pointers_vec) {
             Ok(opencl_heap) => opencl_heap,
             Err(err) => {
                 eprintln!("OpenCL search failed: {}", err);
                 eprintln!("Falling back to CPU search.");
-                cpu_search(&shared_config, &shared_strings, &shared_pointers)
+                if shared_config.offset == 0x1000 {
+                    cpu_search_fast(&shared_config, &shared_strings, &pointers_vec)
+                } else {
+                    cpu_search(&shared_config, &shared_strings, &shared_pointers)
+                }
             }
         }
+    } else if shared_config.offset == 0x1000 {
+        cpu_search_fast(&shared_config, &shared_strings, &pointers_vec)
     } else {
         cpu_search(&shared_config, &shared_strings, &shared_pointers)
     };
